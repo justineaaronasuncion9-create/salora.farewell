@@ -2488,6 +2488,10 @@
           <option value="7">7 days</option>
         </select>
       </div>
+      <div style="text-align:center; margin-top:0.6rem;">
+        <label for="bookingSurname" style="font-size:0.95rem; color:#415b6d; margin-right:0.5rem;">Surname / Family name:</label>
+        <input id="bookingSurname" type="text" placeholder="e.g. Garcia" style="padding:6px 8px; border-radius:6px; border:1px solid #dcdcdc; width:160px;" />
+      </div>
       <div id="bookingCalendar" class="booking-calendar" style="margin-top:0.75rem; display:grid; gap:6px; grid-template-columns: repeat(7,1fr); text-align:center; flex-shrink:0;"></div>
       <div id="bookedList" style="text-align:center; font-size:0.9rem; color:#2f4963; margin-top:0.5rem; padding:0.5rem; border-radius:8px; background:#f9f9f9;"></div>
       <div class="booking-actions">
@@ -2873,6 +2877,24 @@
       localStorage.setItem('room_bookings', JSON.stringify(obj));
     }
 
+    /* Owners metadata (localStorage-only). Keeps ownerId/ownerName per category+date
+       This is separate from the simple array used for Firestore compatibility. */
+    function _loadBookingOwners(){
+      try { return JSON.parse(localStorage.getItem('room_booking_owners') || '{}'); } catch(e){ return {}; }
+    }
+    function _saveBookingOwners(obj){
+      try { localStorage.setItem('room_booking_owners', JSON.stringify(obj)); } catch(e){}
+    }
+
+    /* Ensure each browser/tab has a stable user id so we can tell who created a booking. */
+    function _getCurrentUserId(){
+      try {
+        let id = localStorage.getItem('booking_user_id');
+        if (!id) { id = 'u_' + Date.now() + '_' + Math.floor(Math.random()*90000 + 10000); localStorage.setItem('booking_user_id', id); }
+        return id;
+      } catch(e) { return 'u_unknown'; }
+    }
+
     /* --- Firestore integration (optional) -------------------------------------------------
        To enable shared, realtime bookings across users, call `setupFirestore(yourConfig)`
        with your Firebase project config object. Example:
@@ -3003,6 +3025,8 @@
       // set duration selector default
       const durEl = document.getElementById('bookingDuration');
       if (durEl) { durEl.value = '1'; durEl.onchange = function(){ _bookingState.duration = parseInt(this.value||'1',10); renderBookingCalendar(); }; }
+      // populate surname input from last-used value
+      try{ const sEl = document.getElementById('bookingSurname'); if (sEl) { sEl.value = localStorage.getItem('booking_user_name') || ''; } }catch(e){}
       renderBookingCalendar();
       modal.style.display = 'flex';
       modal.setAttribute('aria-hidden', 'false');
@@ -3040,6 +3064,8 @@
       const bookings = _loadBookings();
       const catBookings = bookings[_bookingState.category] || [];
       const bookedSet = new Set(catBookings);
+      const owners = _loadBookingOwners();
+      const catOwners = owners[_bookingState.category] || {};
       const today = new Date();
       for(let d=1; d<=daysInMonth; d++){
         const cell = document.createElement('div');
@@ -3057,6 +3083,13 @@
         if (isBooked) { cell.setAttribute('aria-disabled','true'); }
         if (isBooked) {
           cell.classList.add('booked');
+          // attach owner tooltip/title when available
+          const o = catOwners[dayStr];
+          if (o && o.ownerName) {
+            cell.title = `Reserved for the ${o.ownerName} family`;
+          } else {
+            cell.title = 'Reserved';
+          }
           // meatball menu button (three-dot) that opens a small popup with actions
           cell.style.position = cell.style.position || 'relative';
           const mb = document.createElement('button');
@@ -3099,7 +3132,14 @@
           optDel.style.background = 'transparent';
           optDel.style.border = 'none';
           optDel.style.cursor = 'pointer';
-          optDel.onclick = (ev)=>{ ev.stopPropagation(); if (confirm('Delete booking '+dayStr+'?')){ deleteBookedDate(dayStr); } menu.style.display='none'; mb.setAttribute('aria-expanded','false'); };
+          optDel.onclick = (ev)=>{ ev.stopPropagation();
+            // only allow deletion if current user is owner (localStorage-only guard)
+            const cur = _getCurrentUserId();
+            const owner = (catOwners && catOwners[dayStr]) ? catOwners[dayStr].ownerId : null;
+            if (owner && owner !== cur) { alert('Only the user who reserved this date can remove it.'); menu.style.display='none'; mb.setAttribute('aria-expanded','false'); return; }
+            if (confirm('Delete booking '+dayStr+'?')){ deleteBookedDate(dayStr); }
+            menu.style.display='none'; mb.setAttribute('aria-expanded','false');
+          };
 
           const optMove = document.createElement('button');
           optMove.type = 'button';
@@ -3109,7 +3149,11 @@
           optMove.style.background = 'transparent';
           optMove.style.border = 'none';
           optMove.style.cursor = 'pointer';
-          optMove.onclick = (ev)=>{ ev.stopPropagation(); startMoveBooking(dayStr); menu.style.display='none'; mb.setAttribute('aria-expanded','false'); };
+          optMove.onclick = (ev)=>{ ev.stopPropagation();
+            const cur = _getCurrentUserId();
+            const owner = (catOwners && catOwners[dayStr]) ? catOwners[dayStr].ownerId : null;
+            if (owner && owner !== cur) { alert('Only the user who reserved this date can move it.'); menu.style.display='none'; mb.setAttribute('aria-expanded','false'); return; }
+            startMoveBooking(dayStr); menu.style.display='none'; mb.setAttribute('aria-expanded','false'); };
 
           menu.appendChild(optDel);
           menu.appendChild(optMove);
@@ -3148,6 +3192,21 @@
                     return alert('Error moving booking: ' + msg);
                   }
                   try { const bookings = _loadBookings(); bookings[cat] = res.dates || []; _saveBookings(bookings); } catch(e){}
+                  // try transfer owner metadata locally (best-effort)
+                  try{
+                    const owners = _loadBookingOwners();
+                    owners[cat] = owners[cat] || {};
+                    const originals = (_moveState.original||[]).slice();
+                    for(let i=0;i<originals.length;i++){
+                      const orig = originals[i];
+                      const ownerObj = owners[cat] && owners[cat][orig] ? owners[cat][orig] : null;
+                      if (ownerObj) {
+                        const target = newDates[i] || newDates[0];
+                        if (target) { owners[cat][target] = ownerObj; delete owners[cat][orig]; }
+                      }
+                    }
+                    _saveBookingOwners(owners);
+                  } catch(e){}
                   _moveState = null;
                   alert('Booking moved to: ' + newDates.join(', '));
                   renderBookingCalendar();
@@ -3163,6 +3222,22 @@
               bookings[cat] = (bookings[cat] || []).filter(d=> !((_moveState.original||[]).includes(d))).concat(newDates);
               bookings[cat] = Array.from(new Set(bookings[cat])).sort();
               _saveBookings(bookings);
+              // Transfer owner metadata for moved dates (local-only)
+              try{
+                const owners = _loadBookingOwners();
+                owners[cat] = owners[cat] || {};
+                const originals = (_moveState.original||[]).slice();
+                for(let i=0;i<originals.length;i++){
+                  const orig = originals[i];
+                  const ownerObj = owners[cat] && owners[cat][orig] ? owners[cat][orig] : null;
+                  if (ownerObj) {
+                    // assign to corresponding new date if available, else skip
+                    const target = newDates[i] || newDates[0];
+                    if (target) { owners[cat][target] = ownerObj; delete owners[cat][orig]; }
+                  }
+                }
+                _saveBookingOwners(owners);
+              } catch(e){}
               _moveState = null;
               alert('Booking moved to: ' + newDates.join(', '));
               renderBookingCalendar();
@@ -3188,7 +3263,13 @@
       }
       // show booked dates list
       if (catBookings.length) {
-        bookedList.textContent = `Booked dates: ${catBookings.join(', ')}`;
+        try {
+          const parts = catBookings.map(d => {
+            const o = (catOwners && catOwners[d]) ? catOwners[d].ownerName : null;
+            return o ? `${d} (${o} family)` : d;
+          });
+          bookedList.textContent = `Booked dates: ${parts.join(', ')}`;
+        } catch(e){ bookedList.textContent = `Booked dates: ${catBookings.join(', ')}`; }
       } else {
         bookedList.textContent = 'No bookings for this category yet.';
       }
@@ -3285,7 +3366,17 @@
               }
               // success: mirror result to local storage and UI
               try { const bookings = _loadBookings(); bookings[pending.category] = res.dates || []; _saveBookings(bookings); } catch(e){}
-              try { localStorage.removeItem('pending_room_booking'); } catch(e){}
+                  try {
+                    // store owner metadata locally for these dates
+                    try {
+                      const owners = _loadBookingOwners();
+                      const cat = pending.category;
+                      owners[cat] = owners[cat] || {};
+                      (pending.dates || []).forEach(d => { owners[cat][d] = { ownerId: pending.ownerId || _getCurrentUserId(), ownerName: pending.ownerName || localStorage.getItem('booking_user_name') || null }; });
+                      _saveBookingOwners(owners);
+                    } catch(e){}
+                  } catch(e){}
+                  try { localStorage.removeItem('pending_room_booking'); } catch(e){}
               removePendingBanner(); alert('Booking finalized. Dates booked: ' + (res.dates||[]).join(', ')); renderBookingCalendar(); showThankYou();
             }).catch(err=>{ console.error('Firestore finalize error', err); alert('Unable to finalize booking via Firestore.'); });
             return;
@@ -3301,6 +3392,13 @@
           if (conflict) return alert('Unable to finalize: one or more dates were already taken: ' + conflict);
           bookings[cat] = Array.from(new Set(bookings[cat].concat(pending.dates))).sort();
           _saveBookings(bookings);
+          // Save owner metadata for these dates (local-only)
+          try {
+            const owners = _loadBookingOwners();
+            owners[cat] = owners[cat] || {};
+            (pending.dates || []).forEach(d => { owners[cat][d] = { ownerId: pending.ownerId || _getCurrentUserId(), ownerName: pending.ownerName || localStorage.getItem('booking_user_name') || null }; });
+            _saveBookingOwners(owners);
+          } catch(e){}
           // clear pending
           try { localStorage.removeItem('pending_room_booking'); } catch(e){}
           removePendingBanner();
@@ -3497,8 +3595,14 @@
       const conflict = datesToBook.find(d=> existing.has(d));
       if (conflict) { alert('One or more selected dates are already booked for this room: ' + conflict); renderBookingCalendar(); return; }
 
-      // Store as a pending booking and open external Google Form.
-      const pending = { category: _bookingState.category, dates: datesToBook, timestamp: Date.now() };
+      // Read surname input to attach to this reservation (shown on hover)
+      const surnameEl = document.getElementById('bookingSurname');
+      const enteredName = surnameEl ? String(surnameEl.value||'').trim() : (localStorage.getItem('booking_user_name')||'');
+      if (!enteredName) { alert('Surname/family name required to reserve the date. Booking cancelled.'); renderBookingCalendar(); return; }
+      try { localStorage.setItem('booking_user_name', enteredName); } catch(e){}
+      const ownerId = _getCurrentUserId();
+      // Store as a pending booking (includes owner metadata)
+      const pending = { category: _bookingState.category, dates: datesToBook, timestamp: Date.now(), ownerId: ownerId, ownerName: enteredName };
       try { localStorage.setItem('pending_room_booking', JSON.stringify(pending)); } catch(e){}
 
       // Open external Google Form in new tab for additional info (per-category URLs)
@@ -3524,11 +3628,20 @@
 
     function deleteBookedDate(dateStr){
       const cat = _bookingState.category;
+      // local guard: only allow deletion if current user created this booking
+      try{
+        const owners = _loadBookingOwners();
+        const owner = owners && owners[cat] && owners[cat][dateStr] ? owners[cat][dateStr].ownerId : null;
+        const cur = _getCurrentUserId();
+        if (owner && owner !== cur) { return alert('Only the user who reserved this date can remove it.'); }
+      } catch(e){}
       // If Firestore configured, remove there first
       if (window._useFirestore && window._firestoreReady) {
         window._firestoreReady.then(()=> removeDatesFromFirestore(cat, [dateStr])).then(res=>{
           if (!res || !res.ok){ alert('Unable to remove booking: '+(res && res.err?res.err:'unknown error')); return; }
           try { const bookings = _loadBookings(); bookings[cat] = res.dates || []; _saveBookings(bookings); }catch(e){}
+          // also remove local owner metadata for that date
+          try{ const owners = _loadBookingOwners(); if (owners && owners[cat]) { delete owners[cat][dateStr]; _saveBookingOwners(owners); } }catch(e){}
           alert('Deleted booking '+dateStr);
           renderBookingCalendar();
         }).catch(err=>{ console.error('Firestore delete error', err); alert('Error deleting booking.'); });
@@ -3538,11 +3651,20 @@
       const bookings = _loadBookings();
       bookings[cat] = (bookings[cat] || []).filter(d=>d!==dateStr);
       _saveBookings(bookings);
+      // remove owner metadata for this date
+      try{ const owners = _loadBookingOwners(); if (owners && owners[cat]) { delete owners[cat][dateStr]; _saveBookingOwners(owners); } }catch(e){}
       alert('Deleted booking '+dateStr);
       renderBookingCalendar();
     }
 
     function startMoveBooking(dateStr){
+      // ensure only owner can move
+      try{
+        const owners = _loadBookingOwners();
+        const owner = owners && owners[_bookingState.category] && owners[_bookingState.category][dateStr] ? owners[_bookingState.category][dateStr].ownerId : null;
+        const cur = _getCurrentUserId();
+        if (owner && owner !== cur) { return alert('Only the user who reserved this date can move it.'); }
+      } catch(e){}
       // prepare move state: single-day move
       _moveState = { category: _bookingState.category, original: [dateStr], length: 1 };
       const bookedList = document.getElementById('bookedList');
@@ -4711,8 +4833,6 @@
       }
     });
   </script>
-
-
 
 
 
