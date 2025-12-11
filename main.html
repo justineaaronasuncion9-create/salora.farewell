@@ -4195,9 +4195,22 @@
 
   // If Firestore configured, sync in background (fire and forget - do NOT wait or overwrite UI)
   if (window._useFirestore && window._firestoreReady) {
+    // Attempt a transactional delete on server and then sync local state with server result.
     window._firestoreReady.then(()=> {
-      removeDatesFromFirestore(cat, [dateStr]);
-    }).catch(err=>{ console.error('Firestore delete error', err); });
+      return removeDatesFromFirestore(cat, [dateStr]);
+    }).then(res => {
+      if (res && res.ok) {
+        try {
+          const bookings = _loadBookings();
+          bookings[cat] = (res.dates || []).slice();
+          _saveBookings(bookings);
+          renderBookingCalendar();
+        } catch (e) { console.warn('Failed to apply server delete locally', e); }
+      } else {
+        console.error('Firestore delete failed', res && res.err);
+        // Optionally, re-sync from server snapshot by leaving local as-is and letting listener update.
+      }
+    }).catch(err => { console.error('Firestore delete error', err); });
   }
 }
 
