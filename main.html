@@ -3577,24 +3577,30 @@
       }).then(dateList => ({ok:true, dates: dateList})).catch(err => ({ok:false, err: err && err.message ? err.message : String(err)}));
     }
 
-    // Remove specific dates from a category document in Firestore (only if current user booked them)
+    // Remove specific dates from a category document in Firestore (handles both new and legacy models)
     function removeDatesFromFirestore(category, datesToRemove){
       if (!window._useFirestore || !window._firestore) return Promise.reject(new Error('Firestore not configured'));
       const ref = window._firestore.collection('bookings').doc(category);
       return window._firestore.runTransaction(tx => {
         return tx.get(ref).then(doc => {
-          const currentBookings = (doc.exists && doc.data().bookings) ? doc.data().bookings : {};
-          // Admin can remove any dates (no ownership check needed)
-          const updated = { ...currentBookings };
-          datesToRemove.forEach(d => delete updated[d]);
-          tx.set(ref, { bookings: updated }, { merge: true });
-          return Object.keys(updated).sort();
+          const data = (doc.exists && doc.data()) ? doc.data() : {};
+          // If using the new model (bookings object), remove keys
+          if (data.bookings && typeof data.bookings === 'object') {
+            const updated = { ...data.bookings };
+            (datesToRemove || []).forEach(d => { delete updated[d]; });
+            tx.set(ref, { bookings: updated }, { merge: true });
+            return Object.keys(updated).sort();
+          }
+          // If using legacy array model, remove from the array
+          if (Array.isArray(data.dates)) {
+            const remaining = (data.dates || []).filter(d => (datesToRemove || []).indexOf(d) === -1);
+            tx.set(ref, { dates: remaining }, { merge: true });
+            return remaining.slice().sort();
+          }
+          // No bookings present - nothing to remove
+          return [];
         });
-      }).then(dateList => {
-        return {ok:true, dates: dateList};
-      }).catch(err => {
-        return {ok:false, err: err && err.message ? err.message : String(err)};
-      });
+      }).then(dateList => ({ ok: true, dates: dateList })).catch(err => ({ ok: false, err: err && err.message ? err.message : String(err) }));
     }
 
     // Move (remove originals and add newDates) in a single Firestore transaction (only if current user owns originals)
